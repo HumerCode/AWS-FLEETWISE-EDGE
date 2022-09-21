@@ -1,8 +1,13 @@
 # Change Log
 
-## future release (TBD)
+## v1.0.0 (Sept 27, 2022)
 Bugfixes:
 * Fixed an OBD bug in which software requests more than six PID ranges in one message. The new revision request the extra range in a separate message.
+
+Improvements:
+* Remove FleetWise CLI Preview version Model. 
+* Update Customer Demo and Documentation to use official AWS CLI to invoke FleetWise API. 
+* Update Customer Demo to remove service-linked role creation for FleetWise Account Registration.
 
 ## v0.1.4 (Aug 29, 2022)
 https://s3.console.aws.amazon.com/s3/object/aws-iot-fleetwise?prefix=v0.1.4/aws-iot-fleetwise-edge.zip

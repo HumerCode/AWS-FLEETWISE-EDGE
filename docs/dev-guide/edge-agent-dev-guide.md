@@ -69,9 +69,7 @@ The instructions below will register your AWS account for AWS IoT FleetWise, cre
    ```bash
    git clone https://github.com/aws/aws-iot-fleetwise-edge.git ~/aws-iot-fleetwise-edge \
        && cd ~/aws-iot-fleetwise-edge/tools/cloud \
-       && pip3 install wrapt==1.10.0 plotly==5.3.1 pandas==1.3.4 cantools==36.4.0 \
-       && aws configure add-model --service-model file://iotfleetwise-2021-06-17.json \
-           --service-name iotfleetwise
+       && pip3 install wrapt==1.10.0 plotly==5.3.1 pandas==1.3.4 cantools==36.4.0 
    ```
 
    The AWS IoT FleetWise Cloud demo script performs the following:
@@ -240,10 +238,7 @@ The instructions below will register your AWS account for AWS IoT FleetWise, cre
 
    ```bash
    cd ~/aws-iot-fleetwise-edge/tools/cloud \
-       && sudo -H ./install-deps.sh \
-       && aws configure add-model \
-           --service-model file://iotfleetwise-2021-06-17.json \
-           --service-name iotfleetwise
+       && sudo -H ./install-deps.sh
    ```
 
 1. Run the following to explore the AWS IoT FleetWise CLI:

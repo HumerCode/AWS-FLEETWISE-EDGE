@@ -1,0 +1,516 @@
+stages:
+  - build
+  - test
+  - package
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  DOCKER_REGISTRY:      763496144766.dkr.ecr.us-west-2.amazonaws.com
+  KE_TOOLCHAIN_VERSION: aff08cbb
+  KE_NATIVE_ENV:        $DOCKER_REGISTRY/ke-native-env:${KE_TOOLCHAIN_VERSION}
+  KE_DOCKER:            $DOCKER_REGISTRY/ke-docker:${KE_TOOLCHAIN_VERSION}
+  KE_COVERITY:          $DOCKER_REGISTRY/ke-coverity:${KE_TOOLCHAIN_VERSION}
+  KE_TARGET_ENV_ARM64:  $DOCKER_REGISTRY/ke-target-env-arm64:${KE_TOOLCHAIN_VERSION}
+  KE_TARGET_ENV_ARMHF:  $DOCKER_REGISTRY/ke-target-env-armhf:${KE_TOOLCHAIN_VERSION}
+  KE_YOCTO_ENV:         $DOCKER_REGISTRY/ke-yocto-env:${KE_TOOLCHAIN_VERSION}
+  KE_TARGET_ENV_S32G:   $DOCKER_REGISTRY/ke-target-env-s32g:0f1fc6f0
+  ACAT_CLI:             $DOCKER_REGISTRY/acat-cli:latest
+
+acat-analysis:
+  image: $ACAT_CLI
+  stage: build
+  script:
+    - mkdir report && cd report
+    - /opt/acat-cli/*/acat-cli analyze --filter-findings ${CI_PROJECT_DIR}/acat-filter-findings.json ${CI_PROJECT_DIR}
+  artifacts:
+    name: "fwe_acat_analysis_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "ACAT Analysis"
+    when: always
+    paths:
+      - report/
+    expire_in: 1 week
+
+coverity-analysis:
+  image: $KE_COVERITY
+  stage: build
+  script:
+    - mkdir build && cd build
+    - mkdir report
+    - cov-configure --config coverity-config.xml --compiler c++ --comptype gcc --template
+    - cmake -DCMAKE_BUILD_TYPE=Debug -DFWE_FEATURE_CAMERA=On ..
+    - cov-build --config coverity-config.xml --dir . make -j`nproc`
+    - cov-analyze --dir . --all --aggressiveness-level high
+    - cov-format-errors --config coverity-config.xml --dir . --emacs-style --exclude-files "(^/usr/.*|.*/build/proto/.*|.*/idls/.*|.*/test/.*)" > report/coverity_report.txt
+    - NUM_ERRORS=`cat report/coverity_report.txt | grep -c 'Type:' || true`
+    - if [ "$NUM_ERRORS" != 0 ]; then
+    -    echo "$NUM_ERRORS errors"
+    -    exit 1
+    - fi
+  artifacts:
+    name: "fwe_coverity_analysis_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Coverity Analysis"
+    when: always
+    paths:
+      - build/report/
+    expire_in: 1 week
+
+native-debug-build:
+  image: $KE_NATIVE_ENV
+  stage: build
+  script:
+    - mkdir build && cd build
+    - cmake -DCMAKE_BUILD_TYPE=Debug -DFWE_FEATURE_CAMERA=On -DFWE_STATIC_LINK=On 
+        -DFWE_SECURITY_COMPILE_FLAGS=On -DFWE_CODE_COVERAGE=On -DFWE_VALGRIND=On ..
+    - make -j`nproc`
+  artifacts:
+    name: "fwe_native_debug_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Native Debug Build"
+    paths:
+      - build/
+    expire_in: 1 week
+
+native-release-build:
+  image: $KE_NATIVE_ENV
+  stage: build
+  script:
+    - ./tools/renaming/check-forbidden-words.sh
+    - json validate --schema-file=interfaces/protobuf/schemas/edgeConfiguration/staticConfiguration.json --document-file=configuration/static-config.json
+    - mkdir build && cd build
+    - cmake -DCMAKE_BUILD_TYPE=Release -DFWE_FEATURE_CAMERA=On -DFWE_STATIC_LINK=On -DBUILD_TESTING=Off ..
+    - make -j`nproc`
+    # Generate the static-ram-rom-report
+    - python3 ../tools/magic-scripts/visualize-elf-static-ram-rom/analyse_static_memory.py
+        src/executionmanagement/aws-iot-fleetwise-edge.map
+        src/executionmanagement/aws-iot-fleetwise-edge
+        static-ram-rom-report
+    # Copy to S3:
+    - aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-${CI_COMMIT_SHORT_SHA}-amd64
+    - aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release-us-east-1/aws-iot-fleetwise-edge-${CI_COMMIT_SHORT_SHA}-amd64
+    - aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release-eu-west-3/aws-iot-fleetwise-edge-${CI_COMMIT_SHORT_SHA}-amd64
+    - if [ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH" ]; then
+    -   aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-amd64
+    -   aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release-us-east-1/aws-iot-fleetwise-edge-amd64
+    -   aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release-eu-west-3/aws-iot-fleetwise-edge-amd64
+    - fi
+  artifacts:
+    name: "fwe_native_release_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Native Release Build"
+    paths:
+      - build/static-ram-rom-report/
+      - build/src/executionmanagement/aws-iot-fleetwise-edge
+    expire_in: 1 week
+
+native-unit-test:
+  image: $KE_NATIVE_ENV
+  stage: test
+  needs:
+    - native-debug-build
+  coverage: '/lines: (\d+.\d+%)/'
+  script:
+    - cd build
+    - CTEST_OUTPUT_ON_FAILURE=1 ctest -E valgrind
+    - mkdir gcov-report
+    - CODE_COVERAGE_SUMMARY=`python3 -m gcovr
+        -e .+/test/.+
+        -e idls/.+
+        -e proto/.+
+        --html-details gcov-report/index.html
+        --xml coverage.xml
+        --print-summary
+        -r ..`
+    - echo ${CODE_COVERAGE_SUMMARY}
+    - python3 ../tools/upload_metrics.py "$CI_COMMIT_REF_NAME" "$CODE_COVERAGE_SUMMARY"
+  artifacts:
+    name: "fwe_coverage_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Code Coverage"
+    paths:
+      - build/gcov-report/
+    expire_in: 1 week
+    reports:
+      junit: build/**/report-*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: build/coverage.xml
+
+native-unit-test-valgrind:
+  image: $KE_NATIVE_ENV
+  stage: test
+  needs:
+    - native-debug-build
+  script:
+    - cd build
+    - CTEST_OUTPUT_ON_FAILURE=1 ctest -R valgrind
+
+target-debug-build-arm64:
+  image: $KE_TARGET_ENV_ARM64
+  stage: build
+  only:
+    variables:
+      - $DEBUG_BUILDS == 'true'
+  script:
+    - mkdir build && cd build
+    - cmake -DCMAKE_BUILD_TYPE=Debug -DFWE_FEATURE_CAMERA=On -DFWE_STATIC_LINK=On
+        -DCMAKE_TOOLCHAIN_FILE=/usr/local/aarch64-linux-gnu/lib/cmake/arm64-toolchain.cmake
+        ${CI_PROJECT_DIR}
+    - make -j`nproc`
+  artifacts:
+    name: "fwe_arm64_debug_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "ARM64 Debug Build"
+    paths:
+      - build/
+    expire_in: 1 week
+
+target-release-build-arm64:
+  image: $KE_TARGET_ENV_ARM64
+  stage: build
+  script:
+    - mkdir /tmp/build && cd /tmp/build
+    - cmake -DCMAKE_BUILD_TYPE=Release -DFWE_FEATURE_CAMERA=On -DFWE_STATIC_LINK=On
+        -DCMAKE_TOOLCHAIN_FILE=/usr/local/aarch64-linux-gnu/lib/cmake/arm64-toolchain.cmake
+        ${CI_PROJECT_DIR}
+    - make -j`nproc`
+    # Strip symbols from all test executables to speed up target-unit-test-s32g
+    - find . -type f -perm /a+x -not -path ./src/executionmanagement/aws-iot-fleetwise-edge -exec aarch64-linux-gnu-strip {} \;
+    # Generate the static-ram-rom-report
+    - python3 ${CI_PROJECT_DIR}/tools/magic-scripts/visualize-elf-static-ram-rom/analyse_static_memory.py
+        src/executionmanagement/aws-iot-fleetwise-edge.map
+        src/executionmanagement/aws-iot-fleetwise-edge
+        static-ram-rom-report
+    # Copy to S3:
+    - aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-${CI_COMMIT_SHORT_SHA}-arm64
+    - if [ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH" ]; then
+    -   aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-arm64
+    - fi
+    - cp -r /tmp/build ${CI_PROJECT_DIR}
+  artifacts:
+    name: "fwe_target_arm64_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Target Release Build arm64"
+    paths:
+      - build/
+    expire_in: 1 week
+
+target-release-build-armhf:
+  image: $KE_TARGET_ENV_ARMHF
+  stage: build
+  script:
+    - mkdir /tmp/build && cd /tmp/build
+    - cmake -DCMAKE_BUILD_TYPE=Release -DFWE_FEATURE_CAMERA=On -DFWE_STATIC_LINK=On
+        -DCMAKE_TOOLCHAIN_FILE=/usr/local/arm-linux-gnueabihf/lib/cmake/armhf-toolchain.cmake
+        ${CI_PROJECT_DIR}
+    - make -j`nproc`
+    # Strip symbols from all test executables to speed up target-unit-test-s32g
+    - find . -type f -perm /a+x -not -path ./src/executionmanagement/aws-iot-fleetwise-edge -exec arm-linux-gnueabihf-strip {} \;
+    # Generate the static-ram-rom-report
+    - python3 ${CI_PROJECT_DIR}/tools/magic-scripts/visualize-elf-static-ram-rom/analyse_static_memory.py
+        src/executionmanagement/aws-iot-fleetwise-edge.map
+        src/executionmanagement/aws-iot-fleetwise-edge
+        static-ram-rom-report
+    # Copy to S3:
+    - aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-${CI_COMMIT_SHORT_SHA}-armhf
+    - if [ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH" ]; then
+    -   aws s3 cp src/executionmanagement/aws-iot-fleetwise-edge s3://ke-release/aws-iot-fleetwise-edge-armhf
+    - fi
+    - cp -r /tmp/build ${CI_PROJECT_DIR}
+  artifacts:
+    name: "fwe_target_armhf_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Target Release Build armhf"
+    paths:
+      - build/
+    expire_in: 1 week
+
+target-release-build-s32g:
+  image: $KE_TARGET_ENV_S32G
+  stage: build
+  script:
+    - source /opt/fsl-auto/1.0/environment-setup-aarch64-fsl-linux
+    - mkdir build && cd build
+    - cmake -DCMAKE_BUILD_TYPE=Release -DFWE_FEATURE_CAMERA=On -DFWE_STRIP_SYMBOLS=On -DBUILD_TESTING=Off ..
+    - make -j`nproc`
+  artifacts:
+    name: "fwe_target_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Target Release Build S32G"
+    paths:
+      - build/
+    expire_in: 1 week
+
+target-unit-test-s32g:
+  image: $KE_NATIVE_ENV
+  stage: test
+  needs:
+    - target-release-build-arm64
+  script:
+    - ./tools/target-unit-test-s32g.sh
+  artifacts:
+    reports:
+      junit: build/**/report-*.xml
+
+native-package:
+  image: $KE_DOCKER
+  stage: package
+  needs:
+    - native-release-build
+  variables:
+    KE_IMAGE: $DOCKER_REGISTRY/ke
+  script:
+    - cp -r systemtest/testframework/canigen tools/docker
+    - cp configuration/static-config.json tools/docker
+    - cp build/src/executionmanagement/aws-iot-fleetwise-edge tools/docker
+    - docker build -t $KE_IMAGE:$CI_COMMIT_SHORT_SHA --build-arg BASE_IMAGE=$KE_NATIVE_ENV tools/docker
+    - docker push $KE_IMAGE:$CI_COMMIT_SHORT_SHA
+    # If this is a mainline build, also push to the ke:latest tag
+    - if [ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH" ]; then
+    -   docker tag $KE_IMAGE:$CI_COMMIT_SHORT_SHA $KE_IMAGE:latest
+    -   docker push $KE_IMAGE:latest
+    - fi
+
+trigger-vehicle-simulator-launcher-build:
+  stage: package
+  needs: 
+    - native-unit-test
+    - native-unit-test-valgrind
+    - native-system-test
+    - target-unit-test-s32g
+  trigger: 
+    project: aws-iot-automotive/IoTAutobahnVehicleLauncher
+    branch: mainline
+  variables:
+    FWE_COMMIT: ${CI_COMMIT_SHORT_SHA}
+    FWE_BRANCH: ${CI_COMMIT_REF_NAME}
+
+native-system-test:
+  image: $KE_NATIVE_ENV
+  stage: test
+  needs:
+    - native-release-build
+  script:
+    - cd systemtest
+    - ./testframework/gen.sh
+    - TEST_FWE_BINARY=../build/src/executionmanagement/aws-iot-fleetwise-edge
+      TEST_CREATE_NEW_AWS_THING=true
+      TEST_BRANCH="$CI_COMMIT_REF_NAME"
+      python3 -u -m unittest discover
+    - cd .. && python3 tools/loadtest_metrics_check/check_loadtest_metrics.py
+  artifacts:
+    name: "fwe_native_system_test_logs_${CI_COMMIT_SHORT_SHA}"
+    when: always
+    paths:
+      - systemtest/core*
+      - systemtest/run
+    expire_in: 1 week
+
+native-system-nightly-test:
+  image: $KE_NATIVE_ENV
+  stage: test
+  only:
+    variables:
+      - $NIGHTLY_PIPELINE == 'true'
+  needs:
+    - native-release-build
+  script:
+    - ./systemtest/testframework/setup-network-namespace.sh
+    - cd systemtest
+    - ./testframework/gen.sh
+    - TEST_FWE_BINARY=../build/src/executionmanagement/aws-iot-fleetwise-edge
+      TEST_CREATE_NEW_AWS_THING=true
+      TEST_BRANCH="$CI_COMMIT_REF_NAME"
+      python3 -u -m unittest discover -p "nightly_test_*.py"
+  artifacts:
+    name: "fwe_native_system_test_logs_${CI_COMMIT_SHORT_SHA}"
+    when: always
+    paths:
+      - systemtest/core*
+      - systemtest/run
+    expire_in: 1 week
+
+target-system-test-s32g:
+  image: $KE_NATIVE_ENV
+  stage: test
+  only:
+    variables:
+      - $NIGHTLY_PIPELINE == 'true'
+  needs:
+    - target-release-build-arm64
+  script:
+    - CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME}
+      KE_NATIVE_ENV=${KE_NATIVE_ENV}
+      ./tools/target-system-test-s32g.sh
+  artifacts:
+    name: "fwe_target_system_test_logs_${CI_COMMIT_SHORT_SHA}"
+    when: always
+    expose_as: "Logs"
+    paths:
+      - systemtest/run
+    expire_in: 1 week
+
+customer-release-package:
+  image: $KE_NATIVE_ENV
+  stage: build
+  script:
+    - ./tools/customer_release/package.sh
+    - aws s3 cp --recursive build_customer_release/out s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}
+  artifacts:
+    name: "fwe_customer_release_package_${CI_COMMIT_SHORT_SHA}"
+    expose_as: "Customer Release Package"
+    paths:
+      - build_customer_release
+    expire_in: 1 week
+
+.customer-release-test-fwdemo-template:
+  image: $KE_NATIVE_ENV
+  stage: test
+  allow_failure: true
+  timeout: 30 minutes
+  # Only run this job as part of the nightly pipeline:
+  only:
+    variables:
+      - $NIGHTLY_PIPELINE == 'true'
+  needs:
+    - job: customer-release-package
+      artifacts: false
+  script:
+    - openssl rand -hex 2 > random-value.txt
+    - PROJECT_NAME=fwdemo-${CI_COMMIT_SHORT_SHA}-`cat random-value.txt`
+    - TEMPLATE_PRESIGNED_URL=`aws s3 presign ${TEMPLATE_URL}`
+    # Create the CloudFormation stack
+    - aws cloudformation create-stack
+        --stack-name ${PROJECT_NAME}
+        --template-url ${TEMPLATE_PRESIGNED_URL}
+        --parameters
+          ParameterKey=SourceUrl,ParameterValue=${SOURCE_URL}
+          ParameterKey=FleetSize,ParameterValue=${FLEET_SIZE}
+          ParameterKey=IoTCoreRegion,ParameterValue=${REGION}
+          ParameterKey=IoTCoreEndpointUrl,ParameterValue=${IOT_CORE_ENDPOINT_URL}
+          ParameterKey=IoTMqttTopicPrefix,ParameterValue=${IOT_MQTT_PREFIX}
+        --capabilities CAPABILITY_AUTO_EXPAND CAPABILITY_NAMED_IAM
+    - aws cloudformation wait stack-create-complete --stack-name ${PROJECT_NAME}
+    # Run the cloud demo script
+    - if echo ${SOURCE_URL} | grep -q 's3://'; then
+    -   aws s3 cp ${SOURCE_URL} .
+    -   unzip aws-iot-fleetwise-edge.zip -d aws-iot-fleetwise-edge
+    - else
+    -   git clone ${SOURCE_URL}
+    - fi
+    - cd aws-iot-fleetwise-edge/tools/cloud && ./install-deps.sh
+    - ./demo.sh --vehicle-name ${PROJECT_NAME} --fleet-size ${FLEET_SIZE} --region ${REGION} --endpoint-url ${IOT_FLEETWISE_ENDPOINT_URL} --clean-up
+    - ./demo.sh --vehicle-name ${PROJECT_NAME} --fleet-size ${FLEET_SIZE} --region ${REGION} --endpoint-url ${IOT_FLEETWISE_ENDPOINT_URL} --clean-up --campaign-file campaign-obd-heartbeat.json
+  after_script:
+    - PROJECT_NAME=fwdemo-${CI_COMMIT_SHORT_SHA}-`cat random-value.txt`
+    - aws cloudformation delete-stack --stack-name ${PROJECT_NAME} || true
+    - aws cloudformation wait stack-delete-complete --stack-name ${PROJECT_NAME} || true
+  artifacts:
+    name: "fwe_customer_release_fwdemo_${CLOUD_ENV}_fleet${FLEET_SIZE}_${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - aws-iot-fleetwise-edge/tools/cloud/fwdemo-*.html
+    expire_in: 1 week
+
+customer-release-test-fwdemo-fra-gamma-fleet2:
+  extends: .customer-release-test-fwdemo-template
+  variables:
+    CLOUD_ENV: 'fra-gamma'
+    REGION: eu-central-1
+    IOT_CORE_ENDPOINT_URL: ''
+    IOT_MQTT_PREFIX: '$$aws/iotfleetwise/gamma-eu-central-1/'
+    IOT_FLEETWISE_ENDPOINT_URL: 'https://controlplane.eu-central-1.gamma.kaleidoscope.iot.aws.dev'
+    FLEET_SIZE: 2
+    TEMPLATE_URL: s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}/cfn-templates/fwdemo.yml
+    SOURCE_URL: s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}/aws-iot-fleetwise-edge.zip
+
+customer-release-test-fwdemo-fra-prod-fleet1:
+  extends: .customer-release-test-fwdemo-template
+  variables:
+    CLOUD_ENV: 'fra-prod'
+    REGION: 'eu-central-1'
+    IOT_CORE_ENDPOINT_URL: ''
+    IOT_MQTT_PREFIX: '$$aws/iotfleetwise/'
+    IOT_FLEETWISE_ENDPOINT_URL: 'https://iotfleetwise.eu-central-1.amazonaws.com'
+    FLEET_SIZE: 1
+    TEMPLATE_URL: s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}/cfn-templates/fwdemo.yml
+    SOURCE_URL: s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}/aws-iot-fleetwise-edge.zip
+
+customer-release-test-fwdemo-iad-prod-fleet1-github:
+  extends: .customer-release-test-fwdemo-template
+  variables:
+    CLOUD_ENV: 'iad-prod-github'
+    REGION: 'us-east-1'
+    IOT_CORE_ENDPOINT_URL: ''
+    IOT_MQTT_PREFIX: '$$aws/iotfleetwise/'
+    IOT_FLEETWISE_ENDPOINT_URL: 'https://iotfleetwise.us-east-1.amazonaws.com'
+    FLEET_SIZE: 1
+    TEMPLATE_URL: s3://aws-iot-fleetwise/latest/cfn-templates/fwdemo.yml
+    SOURCE_URL: https://github.com/aws/aws-iot-fleetwise-edge.git
+
+customer-release-test-fwdev-iad-gamma-fleet1:
+  image: $KE_NATIVE_ENV
+  stage: test
+  allow_failure: true
+  timeout: 30 minutes
+  # Only run this job as part of the nightly pipeline:
+  only:
+    variables:
+      - $NIGHTLY_PIPELINE == 'true'
+  needs:
+    - job: customer-release-package
+      artifacts: false
+  script:
+    - openssl rand -hex 2 > random-value.txt
+    - PROJECT_NAME=fwdev-${CI_COMMIT_SHORT_SHA}-`cat random-value.txt`
+    # Create the CloudFormation stack
+    - aws ec2 create-key-pair --key-name ${PROJECT_NAME}-key-pair | jq -r .KeyMaterial > private-key.pem && chmod 700 private-key.pem
+    - aws cloudformation create-stack
+        --stack-name ${PROJECT_NAME}
+        --template-body file://tools/customer_release/aws-iot-fleetwise-edge/tools/cfn-templates/fwdev.yml
+        --parameters ParameterKey=Ec2KeyPair,ParameterValue=${PROJECT_NAME}-key-pair
+        --capabilities CAPABILITY_AUTO_EXPAND CAPABILITY_NAMED_IAM
+    # While the EC2 Graviton instance is being created, cross-compile edge on x86_64:
+    - mkdir aws-iot-fleetwise-edge && cd aws-iot-fleetwise-edge
+    - aws s3 cp s3://kaleidoscope-demo/${CI_COMMIT_SHORT_SHA}/aws-iot-fleetwise-edge.zip .
+    - unzip -q aws-iot-fleetwise-edge.zip
+    - ./tools/install-deps-cross.sh && ./tools/build-fwe-cross.sh && cd ..
+    # Carry on waiting for cfn:
+    - aws cloudformation wait stack-create-complete --stack-name ${PROJECT_NAME}
+    - SSM_INSTANCE_ID=`aws cloudformation describe-stacks --stack-name ${PROJECT_NAME} | jq -r .Stacks[0].Outputs[0].OutputValue`
+    # Copy test script to EC2, run it and copy back the results
+    - scp -o StrictHostKeyChecking=no -i private-key.pem tools/customer_release/customer-release-test-fwdev.sh ubuntu@${SSM_INSTANCE_ID}:customer-release-test-fwdev.sh
+    - ssh -i private-key.pem ubuntu@${SSM_INSTANCE_ID} "PROJECT_NAME=${PROJECT_NAME} CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA} ./customer-release-test-fwdev.sh"
+    - scp -i private-key.pem ubuntu@${SSM_INSTANCE_ID}:aws-iot-fleetwise-edge/tools/cloud/*.html .
+  after_script:
+    - PROJECT_NAME=fwdev-${CI_COMMIT_SHORT_SHA}-`cat random-value.txt`
+    - aws cloudformation delete-stack --stack-name ${PROJECT_NAME} || true
+    - aws cloudformation wait stack-delete-complete --stack-name ${PROJECT_NAME} || true
+    - aws ec2 delete-key-pair --key-name ${PROJECT_NAME}-key-pair || true
+  artifacts:
+    name: "fwe_customer_release_fwdev_${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - '*.html'
+    expire_in: 1 week
+
+customer-release-test-yocto:
+  image: $KE_YOCTO_ENV
+  stage: test
+  timeout: 90 minutes
+  # Only run this job as part of the nightly pipeline:
+  only:
+    variables:
+      - $NIGHTLY_PIPELINE == 'true'
+  needs:
+    - customer-release-package
+  variables:
+    REBUILD_CACHE: 'false'
+  script:
+    - sudo build_customer_release/aws-iot-fleetwise-edge/tools/install-deps-yocto.sh
+    - mkdir -p build_yocto && cd build_yocto
+    - ../build_customer_release/aws-iot-fleetwise-edge/tools/setup-yocto-s32g.sh
+    - source sources/poky/oe-init-build-env build_s32g274ardb2ubuntu
+    - ../../tools/customer_release/remove_errors_from_log.sh
+    - rm -rf ../sources/meta-alb/recipes-extended/opendds
+    - if $REBUILD_CACHE; then
+    -   export DL_DIR=/mnt/yocto-cache/downloads
+    -   export SSTATE_DIR=/mnt/yocto-cache/sstate-cache-ubuntu
+    -   export BB_ENV_EXTRAWHITE="$BB_ENV_EXTRAWHITE DL_DIR SSTATE_DIR"
+    - else
+    -   export SOURCE_MIRROR_URL="file:///mnt/yocto-cache/downloads/"
+    -   export SSTATE_MIRRORS="file://.* file:///mnt/yocto-cache/sstate-cache-ubuntu/PATH \n file://.*/(.*)/(.*) file://${SSTATE_DIR}/native/\1/\2 \n"
+    -   export BB_ENV_EXTRAWHITE="$BB_ENV_EXTRAWHITE SOURCE_MIRROR_URL SSTATE_MIRRORS"
+    - fi
+    - bitbake fsl-image-ubuntu
+    - gzip -fk tmp/deploy/images/s32g274ardb2/fsl-image-ubuntu-s32g274ardb2.sdcard
+    - aws s3 cp tmp/deploy/images/s32g274ardb2/fsl-image-ubuntu-s32g274ardb2.sdcard.gz s3://yocto-image/customer-release/fsl-image-ubuntu-s32g274ardb2.sdcard.gz
